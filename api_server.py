@@ -12,15 +12,88 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 import io
 import json
 import os
+import re
+import subprocess
 import threading
 import time
 
 from PIL import Image
 import requests
+import yt_dlp
 
 import audio_dsp
 import chord_visualizer
 import guitar_detector
+
+# 유튜브 오디오 스트림 URL 캐시
+_STREAM_URL_CACHE: dict[str, tuple[float, str]] = {}
+_STREAM_CACHE_LOCK = threading.Lock()
+
+
+def get_youtube_id(url: str):
+    if not url:
+        return None
+    m = re.search(r"(?:v=|youtu\.be/|shorts/)([A-Za-z0-9_-]{11})", url)
+    return m.group(1) if m else None
+
+
+def get_youtube_audio_url(youtube_url: str) -> str:
+    now = time.time()
+    with _STREAM_CACHE_LOCK:
+        cached = _STREAM_URL_CACHE.get(youtube_url)
+        if cached and (now - cached[0]) < 1800:
+            return cached[1]
+
+    ydl_opts = {
+        "format": "bestaudio/ba/b",
+        "quiet": True,
+        "no_warnings": True,
+        "noplaylist": True,
+        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+    }
+    with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+        info = ydl.extract_info(youtube_url, download=False)
+        audio_url = info.get("url")
+        formats = info.get("formats") or []
+        audio_formats = [
+            f for f in formats
+            if f.get("acodec") != "none" and f.get("url")
+        ]
+        if audio_formats:
+            audio_formats.sort(key=lambda f: f.get("abr") or 0, reverse=True)
+            audio_url = audio_formats[0]["url"]
+
+        if audio_url:
+            with _STREAM_CACHE_LOCK:
+                _STREAM_URL_CACHE[youtube_url] = (now, audio_url)
+        return audio_url or ""
+
+
+def extract_audio_clip_fast(audio_stream_url: str, timestamp_sec: float) -> bytes:
+    if not audio_stream_url:
+        return b""
+    start_time = max(0.0, float(timestamp_sec) - 0.75)
+    duration = 1.50
+    try:
+        cmd = [
+            "ffmpeg",
+            "-hide_banner",
+            "-loglevel", "error",
+            "-ss", f"{start_time:.3f}",
+            "-t", f"{duration:.3f}",
+            "-i", audio_stream_url,
+            "-vn",
+            "-ac", "1",
+            "-ar", "16000",
+            "-f", "wav",
+            "pipe:1",
+        ]
+        proc = subprocess.run(cmd, capture_output=True, timeout=8)
+        if proc.returncode == 0 and len(proc.stdout) > 1000:
+            return proc.stdout
+    except Exception as e:
+        print(f"[API Server] ffmpeg 오디오 추출 오류: {e}")
+    return b""
 
 # API 키 설정 (클라우드 환경변수 GEMINI_API_KEYS 또는 GEMINI_API_KEY 에서 안전하게 로드)
 DEFAULT_API_KEYS = []
@@ -279,10 +352,11 @@ class ApiServerHandler(BaseHTTPRequestHandler):
             raw_body = self.rfile.read(length)
             req = json.loads(raw_body.decode("utf-8"))
 
+            youtube_url = (req.get("youtube_url") or "").strip()
+            timestamp = float(req.get("timestamp") or 0.0)
             frame_b64 = req.get("frame_b64") or ""
             wav_b64 = req.get("wav_b64") or ""
-            timestamp = float(req.get("timestamp") or 0.0)
-            mode = req.get("mode") or ("video" if timestamp > 0 else "image")
+            mode = req.get("mode") or ("youtube" if youtube_url else ("video" if timestamp > 0 else "image"))
 
             if not frame_b64:
                 raise ValueError("frame_b64 (캡처 이미지 데이터)가 누락되었습니다.")
@@ -297,6 +371,15 @@ class ApiServerHandler(BaseHTTPRequestHandler):
                 if "," in wav_b64:
                     wav_b64 = wav_b64.split(",", 1)[1]
                 wav_bytes = base64.b64decode(wav_b64)
+
+            # 유튜브 URL이 있고 클라이언트에서 보낸 wav가 없는 경우, Render 백엔드에서 해당 시점 ±0.75초 오디오 추출
+            if not wav_bytes and youtube_url and get_youtube_id(youtube_url):
+                try:
+                    aud_url = get_youtube_audio_url(youtube_url)
+                    if aud_url:
+                        wav_bytes = extract_audio_clip_fast(aud_url, timestamp)
+                except Exception as e:
+                    print(f"[API Server] 유튜브 오디오 자동 추출 실패 (영상 프레임으로 계속 분석): {e}")
 
             res = run_core_analysis(full_frame, wav_bytes, mode)
 
