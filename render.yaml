@@ -1,0 +1,10 @@
+services:
+  - type: web
+    name: guitar-chord-find4chrome
+    runtime: docker
+    dockerfilePath: Dockerfile
+    envVars:
+      - key: PORT
+        value: 10000
+      - key: GEMINI_API_KEYS
+        sync: false
