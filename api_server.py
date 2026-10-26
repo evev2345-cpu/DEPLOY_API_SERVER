@@ -52,7 +52,7 @@ def get_youtube_audio_url(youtube_url: str) -> str:
         "socket_timeout": 6,
         "extractor_args": {
             "youtube": {
-                "player_client": ["android"],
+                "player_client": ["ios", "android", "mweb"],
                 "player_skip": ["webpage", "configs", "js"],
             }
         },
@@ -150,9 +150,9 @@ def call_gemini_vision_first_fast(
     global _KEY_ROTATION_IDX
     keys = [api_keys] if isinstance(api_keys, str) else list(api_keys)
 
-    b64_full = _pil_to_b64_jpeg(full_frame_pil, max_dim=960, quality=82)
-    b64_clean = _pil_to_b64_jpeg(clean_zoom_pil, max_dim=960, quality=92)
-    b64_annot = _pil_to_b64_jpeg(annotated_zoom_pil, max_dim=800, quality=88)
+    b64_full = _pil_to_b64_jpeg(full_frame_pil, max_dim=720, quality=78)
+    b64_clean = _pil_to_b64_jpeg(clean_zoom_pil, max_dim=720, quality=85)
+    b64_annot = _pil_to_b64_jpeg(annotated_zoom_pil, max_dim=720, quality=82)
 
     payload = {
         "contents": [
