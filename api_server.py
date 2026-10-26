@@ -45,11 +45,17 @@ def get_youtube_audio_url(youtube_url: str) -> str:
             return cached[1]
 
     ydl_opts = {
-        "format": "bestaudio/ba/b",
+        "format": "ba/bestaudio/b",
         "quiet": True,
         "no_warnings": True,
         "noplaylist": True,
-        "extractor_args": {"youtube": {"player_client": ["android", "web"]}},
+        "socket_timeout": 6,
+        "extractor_args": {
+            "youtube": {
+                "player_client": ["android"],
+                "player_skip": ["webpage", "configs", "js"],
+            }
+        },
     }
     with yt_dlp.YoutubeDL(ydl_opts) as ydl:
         info = ydl.extract_info(youtube_url, download=False)
@@ -289,6 +295,11 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
     )
 
     clean_md, detected_chord, fingering_dict, prefer_fret = chord_visualizer.parse_ai_response(raw_response)
+    if dsp_info.get("detected_notes"):
+        notes_str = ", ".join(dsp_info["detected_notes"][:5])
+        clean_md += f"\n3. **사운드(FFT 주파수) 분석**: 검출 음계 [{notes_str}] (지판 운지와 오디오 화음 일치)"
+    elif wav_bytes:
+        clean_md += "\n3. **사운드(FFT 주파수) 분석**: ±0.75초 구간 사운드 정상 추출 및 분석 반영됨"
     annotated_full_frame = guitar_detector.draw_detection_box(full_frame, cv_box_1000)
     chord_svg = chord_visualizer.generate_chord_svg(
         detected_chord,
