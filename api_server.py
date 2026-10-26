@@ -304,6 +304,7 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
         "annotated_zoom_img": annotated_zoom_img,
         "annotated_full_frame": annotated_full_frame,
         "wav_bytes": wav_bytes,
+        "dsp_summary": dsp_info.get("summary_text", ""),
         "used_model": used_model,
     }
 
@@ -392,6 +393,7 @@ class ApiServerHandler(BaseHTTPRequestHandler):
                 "annotated_zoom_data_url": "data:image/jpeg;base64," + _pil_to_b64_jpeg(res["annotated_zoom_img"], max_dim=800, quality=90),
                 "full_box_data_url": "data:image/jpeg;base64," + _pil_to_b64_jpeg(res["annotated_full_frame"], max_dim=960, quality=85),
                 "wav_data_url": ("data:audio/wav;base64," + base64.b64encode(res["wav_bytes"]).decode("ascii")) if res["wav_bytes"] else "",
+                "dsp_summary": res.get("dsp_summary", ""),
                 "timestamp": timestamp,
             }
 
