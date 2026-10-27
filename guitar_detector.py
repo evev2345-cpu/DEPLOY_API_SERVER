@@ -340,16 +340,41 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
             ("3번(약지)", pts[16], pts[14]),
             ("4번(새끼)", pts[20], pts[18]),
         ]
+        if is_thumb_over:
+            finger_tips.insert(0, ("엄지(T)", pts[4], pts[3]))
 
         # Annotated 가이드 이미지 생성 (손가락 관절 선 + 손가락 번호 라벨링)
         annotated_zoom_pil = clean_zoom_pil.copy()
         draw = ImageDraw.Draw(annotated_zoom_pil)
 
+        crop_h, crop_w = clean_crop_rgb.shape[0], clean_crop_rgb.shape[1]
+        ycrcb_crop = cv2.cvtColor(clean_crop_rgb, cv2.COLOR_RGB2YCrCb)
+        skin_mask = (
+            (ycrcb_crop[:, :, 1] >= 133) & (ycrcb_crop[:, :, 1] <= 173) &
+            (ycrcb_crop[:, :, 2] >= 77) & (ycrcb_crop[:, :, 2] <= 127) &
+            (ycrcb_crop[:, :, 0] >= 45)
+        )
+
+        def refine_tip_to_skin(pip_pt, tip_pt):
+            """손가락 끝마디가 지판 목재 위로 비현실적으로 길게 늘어나는(MediaPipe 환각) 현상 방지"""
+            px, py = pip_pt
+            tx, ty = tip_pt
+            steps = 35
+            for s in range(steps):
+                alpha = s / float(steps)
+                cx = int(round((1.0 - alpha) * tx + alpha * px))
+                cy = int(round((1.0 - alpha) * ty + alpha * py))
+                if 0 <= cx < crop_w and 0 <= cy < crop_h:
+                    if skin_mask[cy, cx]:
+                        return (cx, cy)
+            return (int(tx), int(ty))
+
         finger_colors = {
-            1: "#FF3B30",  # 검지(1): 빨강
-            2: "#34C759",  # 중지(2): 초록
-            3: "#007AFF",  # 약지(3): 파랑
-            4: "#AF52DE",  # 새끼(4): 보라
+            "T": "#FF9500",  # 엄지(T): 주황
+            1: "#FF3B30",    # 검지(1): 빨강
+            2: "#34C759",    # 중지(2): 초록
+            3: "#007AFF",    # 약지(3): 파랑
+            4: "#AF52DE",    # 새끼(4): 보라
         }
         finger_chains = [
             (1, [5, 6, 7, 8]),
@@ -359,20 +384,39 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
         ]
         for f_num, chain in finger_chains:
             color = finger_colors[f_num]
-            for a, b in zip(chain[:-1], chain[1:]):
-                pa = (pts[a][0] - x1, pts[a][1] - y1)
-                pb = (pts[b][0] - x1, pts[b][1] - y1)
-                draw.line([pa, pb], fill=color, width=2)
+            c_pts = [(pts[i][0] - x1, pts[i][1] - y1) for i in chain]
+            
+            # 해부학적 관절 길이 비율 제한 (PIP-TIP 거리가 MCP-PIP 길이의 1.15배를 초과하지 못하도록 클램핑)
+            mcp_p, pip_p, tip_p = c_pts[0], c_pts[1], c_pts[3]
+            l_prox = math.hypot(pip_p[0] - mcp_p[0], pip_p[1] - mcp_p[1])
+            if l_prox > 5.0:
+                l_dist = math.hypot(tip_p[0] - pip_p[0], tip_p[1] - pip_p[1])
+                if l_dist > l_prox * 1.15:
+                    ratio = (l_prox * 1.10) / l_dist
+                    c_pts[3] = (
+                        pip_p[0] + (tip_p[0] - pip_p[0]) * ratio,
+                        pip_p[1] + (tip_p[1] - pip_p[1]) * ratio,
+                    )
+            
+            # 피부 경계선 역추적으로 지판 위 연장 차단
+            c_pts[3] = refine_tip_to_skin(c_pts[1], c_pts[3])
+
+            for a, b in zip(c_pts[:-1], c_pts[1:]):
+                draw.line([a, b], fill=color, width=2)
             # 손끝(Tip)은 줄/프렛 접점이 가려지지 않도록 작은 속 빈 원으로 표시하고, 번호 배지는 두 번째 마디(PIP)에 표시
-            tip_x, tip_y = pts[chain[-1]][0] - x1, pts[chain[-1]][1] - y1
+            tip_x, tip_y = c_pts[3]
             draw.ellipse([tip_x - 5, tip_y - 5, tip_x + 5, tip_y + 5], outline=color, width=2)
-            pip_x, pip_y = pts[chain[1]][0] - x1, pts[chain[1]][1] - y1
+            pip_x, pip_y = c_pts[1]
             draw.ellipse([pip_x - 8, pip_y - 8, pip_x + 8, pip_y + 8], fill=color)
             draw.text((pip_x - 3, pip_y - 6), str(f_num), fill="#FFFFFF")
 
-        # 엄지 표시
-        tx, ty = pts[4][0] - x1, pts[4][1] - y1
-        draw.ellipse([tx - 6, ty - 6, tx + 6, ty + 6], outline="#FF9500", width=2)
+        # 엄지(T) 표시: 썸오버 또는 넥 파지 엄지 관절선 및 배지 표시
+        t_tip = (pts[4][0] - x1, pts[4][1] - y1)
+        t_ip = (pts[3][0] - x1, pts[3][1] - y1)
+        draw.line([t_ip, t_tip], fill=finger_colors["T"], width=2)
+        draw.ellipse([t_tip[0] - 6, t_tip[1] - 6, t_tip[0] + 6, t_tip[1] + 6], outline=finger_colors["T"], width=2)
+        draw.ellipse([t_ip[0] - 9, t_ip[1] - 9, t_ip[0] + 9, t_ip[1] + 9], fill=finger_colors["T"])
+        draw.text((t_ip[0] - 4, t_ip[1] - 6), "T", fill="#FFFFFF")
 
         # 상대적 줄 높이(위쪽 6번줄 ~ 아래쪽 1번줄) 순서 정리
         sorted_by_y = sorted(finger_tips, key=lambda item: item[1][1])
@@ -384,7 +428,7 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
             else f"검지(1번) 관절 각도 {index_angle:.0f}°로 구부러져 있어 **단일 줄 독립 운지** 형태임"
         )
         thumb_str = (
-            "엄지(T)가 지판 위쪽(6번줄 방향)으로 올라온 **썸오버(Thumb-over) 폼** 감지됨"
+            "엄지(T)가 지판 위쪽(6번줄 방향)으로 올라온 **썸오버(Thumb-over) 폼** 감지됨 (6번 줄 저음은 엄지(T)가 누르고 있음)"
             if is_thumb_over
             else "엄지(T)가 넥 뒤쪽을 받치는 **클래식/바레 파지 폼** 감지됨"
         )
@@ -395,6 +439,8 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
             f"  - {thumb_str}",
             f"  - 손끝 높이(지판 위쪽 6번줄~아래쪽 1번줄) 순서: {vertical_order_str} (※ 실제 줄을 누르고 있는 활성 손가락만 코드에 반영)",
         ]
+        if is_thumb_over:
+            summary_lines.append("  - **엄지 썸오버 필수 지침**: 엄지(T)가 6번줄 상단을 감싸 쥐고 있으므로, 6번 줄 운지는 엄지(T)가 담당합니다. 절대 검지(1)나 중지(2)가 6번 줄을 누른 것으로 왜곡하지 마세요.")
         if neck_dir_hint:
             summary_lines.append(f"  - 기타 넥 방향: {neck_dir_hint}")
 

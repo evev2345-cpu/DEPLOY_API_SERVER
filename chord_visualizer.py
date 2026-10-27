@@ -454,6 +454,15 @@ def _safe_int(val, default=1):
         return default
 
 
+def _format_finger(f_val):
+    s = str(f_val or '1').strip().upper()
+    if s in ['T', 'THUMB']:
+        return 'T'
+    if s in ['1', '2', '3', '4']:
+        return s
+    return '1'
+
+
 def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None) -> dict:
     """
     AI가 반환한 운지 딕셔너리가 화성학/운지 물리 법칙을 위배할 경우
@@ -699,7 +708,7 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None):
         if 0 <= d_fret < num_frets and 1 <= s_num <= 6:
             cx = start_x + d_fret * fret_width + (fret_width / 2)
             cy = start_y + (s_num - 1) * string_gap
-            finger = _safe_int(d.get('finger'), 1)
+            finger = _format_finger(d.get('finger'))
             svg.append(f'<circle cx="{cx}" cy="{cy}" r="9" fill="#FFFFFF" stroke="#0F1720" stroke-width="1.8" />')
             svg.append(f'<text x="{cx}" y="{cy + 4}" font-size="11" font-weight="800" fill="#0F1720" text-anchor="middle">{finger}</text>')
 
@@ -752,7 +761,11 @@ def parse_ai_response(text: str):
         # 영어로 출력되었거나 내용이 부실한 경우 한국어 자동 구성
         is_english = any(w in summary.lower() for w in ["finger", "fret", "string", "barre", "plays", "chord", "index", "middle", "ring", "pinky"]) and not re.search(r'[가-힣]', summary)
         if is_english or not summary:
-            finger_names = {1: "검지", 2: "중지", 3: "약지", 4: "새끼손가락"}
+            finger_names = {
+                1: "검지", 2: "중지", 3: "약지", 4: "새끼손가락",
+                "1": "검지", "2": "중지", "3": "약지", "4": "새끼손가락",
+                "T": "엄지(T)", "t": "엄지(T)"
+            }
             parts = []
             barre = fingering_dict.get("barre")
             if isinstance(barre, dict) and barre.get("fret"):
@@ -762,7 +775,10 @@ def parse_ai_response(text: str):
             if isinstance(dots, list):
                 for d in dots:
                     if isinstance(d, dict) and "string" in d and "fret" in d:
-                        fn = finger_names.get(d.get("finger", 1), f"{d.get('finger', 1)}번 손가락")
+                        raw_f = d.get("finger", 1)
+                        fn = finger_names.get(raw_f, f"{raw_f}번 손가락")
+                        if str(raw_f).upper() == "T":
+                            fn = "엄지(T)"
                         parts.append(f"{fn}로 {d['string']}번 줄 {d['fret']}프렛")
             if parts:
                 summary = f"{', '.join(parts)}을 운지하는 [{detected_chord}] 코드 폼입니다."

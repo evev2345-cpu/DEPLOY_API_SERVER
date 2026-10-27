@@ -187,7 +187,9 @@ def analyze_audio_wav_bytes(wav_bytes: bytes) -> dict:
         sim = float(np.dot(chroma_unit, unit_template))
         penalty = 0.16 * float(np.mean(chroma[non_chord_mask]))
         bass_bonus = 0.20 * float(bass_chroma[root])
-        score = sim - penalty + bass_bonus
+        # 대중음악/어쿠스틱 기타 빈도 가중치 (기본 코드 우선, 특수 텐션/얼터드는 뚜렷한 경우만 채택)
+        comp_pen = 0.06 if any(alt in chord_name for alt in ['(#9)', '(b9)', '#5', 'b13', 'dim7', 'm7b5']) else 0.0
+        score = sim - penalty + bass_bonus - comp_pen
         chord_scores.append((score, chord_name))
 
     chord_scores.sort(key=lambda x: x[0], reverse=True)
