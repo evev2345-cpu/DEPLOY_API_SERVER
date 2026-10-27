@@ -526,6 +526,72 @@ def detect_lowest_sounding_string(dots, barre, markers):
     return None, None, None
 
 
+def reconcile_fret_with_audio(chord_name: str, fingering_dict: dict, dsp_info: dict, capo: int = 1) -> tuple:
+    """
+    비전 AI가 프렛을 1~2칸 밀려 세어 잘못된 코드를 반환했을 때 (예: 4프렛 C#m7을 2프렛 Bm7으로 오인),
+    오디오 FFT 실음(Concert Pitch)과 카포 오프셋을 역산하여 진정한 지판 코드와 프렛 번호로 자동 보정합니다.
+    """
+    if not isinstance(fingering_dict, dict) or not dsp_info or not isinstance(dsp_info, dict):
+        return chord_name, fingering_dict
+
+    clean_name = re.sub(r'\(.*?\)', '', str(chord_name or '')).strip()
+    m = re.match(r'^([A-G][#b♯♭]?)(.*)$', clean_name)
+    if not m:
+        return chord_name, fingering_dict
+
+    v_root = m.group(1).upper().replace('♯', '#').replace('♭', 'B')
+    v_qual = m.group(2).strip().lower()
+    v_semi = NOTE_TO_SEMITONE.get(v_root, -1)
+    if v_semi < 0:
+        return chord_name, fingering_dict
+
+    top_audio = dsp_info.get('top_chords', [])
+    for tc in top_audio[:3]:
+        am = re.match(r'^([A-G][#b♯♭]?)(.*)$', tc)
+        if not am:
+            continue
+        a_root = am.group(1).upper().replace('♯', '#').replace('♭', 'B')
+        a_qual = am.group(2).strip().lower()
+        a_semi = NOTE_TO_SEMITONE.get(a_root, -1)
+        if a_semi < 0:
+            continue
+
+        fretboard_semi = (a_semi - capo) % 12
+        fretboard_root = SEMITONE_TO_NOTE[fretboard_semi]
+
+        # 화성 퀄리티 상호 호환성 검증 (m7, minor, major 등)
+        qual_compat = (
+            (v_qual == a_qual) or
+            ('m7' in v_qual and 'm7' in a_qual) or
+            ('m' in v_qual and 'm' in a_qual) or
+            (v_qual in ['', 'maj', 'major'] and a_qual in ['', 'maj', 'major'])
+        )
+
+        if qual_compat and fretboard_semi != v_semi:
+            diff = (fretboard_semi - v_semi) % 12
+            if diff > 6:
+                diff -= 12
+            if abs(diff) in [1, 2, 3]:
+                # 1~3프렛 범위의 시각적 프렛 계수 오차 교정
+                new_chord = f"{fretboard_root}{m.group(2).strip()}"
+                fingering_dict['chord'] = new_chord
+                if 'base_fret' in fingering_dict and fingering_dict['base_fret']:
+                    fingering_dict['base_fret'] = max(1, _safe_int(fingering_dict['base_fret']) + diff)
+                if isinstance(fingering_dict.get('barre'), dict) and fingering_dict['barre'].get('fret'):
+                    fingering_dict['barre']['fret'] = max(1, _safe_int(fingering_dict['barre']['fret']) + diff)
+                if isinstance(fingering_dict.get('dots'), list):
+                    for d in fingering_dict['dots']:
+                        if isinstance(d, dict) and 'fret' in d:
+                            d['fret'] = max(1, _safe_int(d['fret']) + diff)
+                fingering_dict['reconciliation_note'] = (
+                    f"오디오 실음 화성({tc}) 및 카포 {capo}프렛 오프셋을 역산하여, "
+                    f"비전 모델의 {diff}프렛 위치 오차를 [{new_chord}]로 자동 보정했습니다."
+                )
+                return new_chord, fingering_dict
+
+    return chord_name, fingering_dict
+
+
 def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None, dsp_info: dict = None) -> dict:
     """
     AI가 반환한 운지 딕셔너리가 화성학/운지 물리 법칙을 위배할 경우
@@ -544,6 +610,10 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
         fingering_dict["dots"] = []
         fingering_dict["barre"] = None
         return fingering_dict
+
+    # 0.1 오디오 FFT 실음 기반 프렛 위치 및 코드명 역추산 보정 (카포 1프렛 기준)
+    if dsp_info and isinstance(dsp_info, dict):
+        clean_name, fingering_dict = reconcile_fret_with_audio(clean_name, fingering_dict, dsp_info, capo=1)
 
     # Capo 등 부가 텍스트 제거 및 분수코드 분리
     clean_name = re.sub(r'\(.*?\)', '', clean_name).strip()
@@ -689,6 +759,23 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
                 f"중지(2번)로 {barre_fret + 1}프렛(2번줄)을 누르는 {clean_name} 마이너 코드 폼입니다."
             )
             return fingering_dict
+        elif quality in ['m7', 'min7', '-7']:
+            fingering_dict["dots"] = [
+                {"string": 4, "fret": target_fret, "finger": 3},
+                {"string": 2, "fret": barre_fret + 1, "finger": 2},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 5,
+                "finger": 1
+            }
+            fingering_dict["markers"] = {6: 'x'}
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~5번줄) 바레, 약지(3번)로 4번줄 {target_fret}프렛, "
+                f"중지(2번)로 2번줄 {barre_fret + 1}프렛을 누르는 A형 마이너7 [{clean_name}] 코드 폼입니다. (6번줄 뮤트, 새끼손가락 미사용)"
+            )
+            return fingering_dict
         elif quality in ['7', 'dom7']:
             fingering_dict["dots"] = [
                 {"string": 4, "fret": target_fret, "finger": 3},
@@ -741,6 +828,21 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
             fingering_dict["fingering_summary"] = (
                 f"검지(1번)로 {barre_fret}프렛 (1~6번줄) 전체 바레, 약지(3번)·새끼(4번)로 {target_fret}프렛(5, 4번줄)을 "
                 f"누르는 E형 마이너 바레 {clean_name} 코드 폼입니다."
+            )
+            return fingering_dict
+        elif quality in ['m7', 'min7', '-7']:
+            fingering_dict["dots"] = [
+                {"string": 5, "fret": target_fret, "finger": 3},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 6,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~6번줄) 전체 바레, 약지(3번)로 {target_fret}프렛(5번줄)을 "
+                f"누르는 E형 마이너7 [{clean_name}] 코드 폼입니다."
             )
             return fingering_dict
 
@@ -1019,10 +1121,13 @@ def parse_ai_response(text: str, prefer_fret: int = None, dsp_info: dict = None)
             else:
                 summary = f"[{detected_chord}] 코드의 기본 운지 형태입니다."
 
+        reconcile_note = fingering_dict.get("reconciliation_note")
         clean_markdown = (
             f"1. **정확한 코드명**: **{detected_chord}**\n"
             f"2. **지판 위치 및 운지 요약**: {summary}"
         )
+        if reconcile_note:
+            clean_markdown += f"\n- **정밀 화성 역추산**: {reconcile_note}"
         return clean_markdown, detected_chord, fingering_dict, prefer_fret
 
     # Fallback: 일반 마크다운 파싱
