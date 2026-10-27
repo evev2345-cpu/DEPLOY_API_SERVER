@@ -451,6 +451,8 @@ def resolve_chord_data(chord_name, prefer_fret=None):
     clean = str(chord_name or "C").strip()
     for p in ["**", "정확한 코드명:", "추정 코드명:", "코드명:", "코드:"]:
         clean = clean.replace(p, "").strip()
+    if clean in ['-', 'NONE', '', '미상', '알 수 없음']:
+        return {'base_fret': 1, 'barre': None, 'dots': [], 'markers': {}, 'chord': '-'}
     clean_main = clean.split("/")[0].split()[0].strip() if clean else "C"
     upper_key = clean.upper().replace(" MAJOR", "").strip()
 
@@ -559,6 +561,50 @@ def reconcile_fret_with_audio(chord_name: str, fingering_dict: dict, dsp_info: d
         fretboard_semi = (a_semi - capo) % 12
         fretboard_root = SEMITONE_TO_NOTE[fretboard_semi]
 
+        # 1-A. 1-현 수직 전이 함정 교정 (A-shape vs E-shape 2D 기하학적 착시)
+        # 예: 4프렛 C#m7(A형 m7) vs 4프렛 G#7(E형 dom7)은 2D상 동일한 핑거링 간격
+        # 5번줄 루트(C#=1)와 6번줄 루트(G#=8)는 (1 - 8) % 12 == 5 (완전4도 / 1-현 간격)
+        barre_fret = _safe_int(fingering_dict.get('barre', {}).get('fret') if isinstance(fingering_dict.get('barre'), dict) else fingering_dict.get('base_fret'), 0)
+        if barre_fret > 0:
+            if (v_semi - fretboard_semi) % 12 == 5:
+                target_qual = a_qual if a_qual else ('7' if '7' in v_qual else '')
+                new_chord = f"{fretboard_root}{target_qual}"
+                fingering_dict['chord'] = new_chord
+                if isinstance(fingering_dict.get('dots'), list):
+                    for d in fingering_dict['dots']:
+                        if isinstance(d, dict) and 'string' in d:
+                            d['string'] = min(6, _safe_int(d['string']) + 1)
+                if isinstance(fingering_dict.get('barre'), dict) and fingering_dict['barre'].get('fret'):
+                    fingering_dict['barre']['start_string'] = 1
+                    fingering_dict['barre']['end_string'] = 6
+                if isinstance(fingering_dict.get('markers'), dict):
+                    fingering_dict['markers'].pop(6, None)
+                fingering_dict['reconciliation_note'] = (
+                    f"오디오 실음 화성({tc}) 및 기저 주파수를 분석하여, 5번줄 루트 폼({chord_name})의 1-현 시각 착시를 "
+                    f"6번줄 루트의 E형 [{new_chord}] 폼으로 자동 교정했습니다."
+                )
+                return new_chord, fingering_dict
+
+            if (fretboard_semi - v_semi) % 12 == 5:
+                target_qual = a_qual if a_qual else ('m7' if '7' in v_qual else 'm')
+                new_chord = f"{fretboard_root}{target_qual}"
+                fingering_dict['chord'] = new_chord
+                if isinstance(fingering_dict.get('dots'), list):
+                    for d in fingering_dict['dots']:
+                        if isinstance(d, dict) and 'string' in d:
+                            d['string'] = max(1, _safe_int(d['string']) - 1)
+                if isinstance(fingering_dict.get('barre'), dict) and fingering_dict['barre'].get('fret'):
+                    fingering_dict['barre']['start_string'] = 1
+                    fingering_dict['barre']['end_string'] = 5
+                if not isinstance(fingering_dict.get('markers'), dict):
+                    fingering_dict['markers'] = {}
+                fingering_dict['markers'][6] = 'x'
+                fingering_dict['reconciliation_note'] = (
+                    f"오디오 실음 화성({tc})을 분석하여 6번줄 루트 폼({chord_name})의 1-현 시각 착시를 "
+                    f"5번줄 루트의 A형 [{new_chord}] 폼으로 자동 교정했습니다."
+                )
+                return new_chord, fingering_dict
+
         # 화성 퀄리티 상호 호환성 검증 (m7, minor, major 등)
         qual_compat = (
             (v_qual == a_qual) or
@@ -592,6 +638,140 @@ def reconcile_fret_with_audio(chord_name: str, fingering_dict: dict, dsp_info: d
     return chord_name, fingering_dict
 
 
+def get_sounding_pitches(fingering_dict: dict) -> tuple:
+    """
+    운지 딕셔너리(barre, dots, markers)에서 실제 소리 나는 음정(0~11)과 현별 음정명을 계산합니다.
+    물리적 원리에 따라 바레 위에 놓인 개별 손가락 프렛이 우선 진동합니다.
+    반환값: (sounding_pitches_set, string_to_note_dict)
+    """
+    sounding_pitches = set()
+    string_notes = {}
+    if not isinstance(fingering_dict, dict):
+        return sounding_pitches, string_notes
+
+    barre = fingering_dict.get("barre")
+    dots = fingering_dict.get("dots") or []
+    markers = fingering_dict.get("markers") or {}
+
+    string_frets = {}
+
+    # 1. 바레가 적용되는 줄 기본 프렛 설정
+    if isinstance(barre, dict) and _safe_int(barre.get("fret"), 0) > 0:
+        bfret = _safe_int(barre["fret"])
+        b_start = min(_safe_int(barre.get("start_string"), 1), _safe_int(barre.get("end_string"), 6))
+        b_end = max(_safe_int(barre.get("start_string"), 1), _safe_int(barre.get("end_string"), 6))
+        for s in range(b_start, b_end + 1):
+            if str(markers.get(s)).lower() not in ['x', 'mute']:
+                string_frets[s] = bfret
+
+    # 2. 개별 운지 점(dots)이 바레를 덮어씀 (물리적으로 더 높은 프렛이 진동)
+    for d in dots:
+        if isinstance(d, dict):
+            s = _safe_int(d.get("string"))
+            f = _safe_int(d.get("fret"))
+            if 1 <= s <= 6 and f > 0:
+                if str(markers.get(s)).lower() not in ['x', 'mute']:
+                    string_frets[s] = f
+
+    # 3. 개방현 설정 (바레나 운지 점이 없는 줄)
+    for s, m in markers.items():
+        s_int = _safe_int(s)
+        if 1 <= s_int <= 6 and str(m).lower() in ['o', 'open', '0']:
+            if s_int not in string_frets:
+                string_frets[s_int] = 0
+
+    # 4. 각 줄의 최종 진동 음정 계산
+    for s, f in string_frets.items():
+        p = (TUNING[s] + f) % 12
+        sounding_pitches.add(p)
+        string_notes[s] = SEMITONE_TO_NOTE[p]
+
+    return sounding_pitches, string_notes
+
+
+def evaluate_chord_confidence(chord_name: str, fingering_dict: dict, dsp_info: dict = None, capo: int = 1) -> tuple:
+    """
+    비전 핑거링, 추정 코드명, 오디오 DSP 정보를 종합하여 신뢰도 점수(0.0 ~ 1.0)를 산출합니다.
+    기준치(0.65) 미만일 경우 Hand-Only(손 위치 전용) 모드로 전환됩니다.
+    반환값: (confidence_score: float, reason: str, is_confident: bool)
+    """
+    if not isinstance(fingering_dict, dict):
+        return 0.0, "운지 데이터 없음", False
+
+    clean_name = str(chord_name or "").strip()
+    if clean_name in ["-", "", "None", "알 수 없음", "미상"]:
+        return 0.0, "코드명 미상", False
+
+    sounding_pitches, string_notes = get_sounding_pitches(fingering_dict)
+    if len(sounding_pitches) < 2:
+        return 0.2, "소리 나는 유효 음정 부족 (2개 미만)", False
+
+    # 1. 이론적 화음 성립도 (Theory Validity)
+    slash_parts = clean_name.split('/')
+    main_chord = slash_parts[0].strip()
+    slash_bass = slash_parts[1].strip().upper() if len(slash_parts) > 1 else None
+
+    m = re.match(r'^([A-G][#b♯♭]?)(.*)$', main_chord)
+    if not m:
+        return 0.3, "비표준 코드 형식", False
+
+    root_str = m.group(1).upper().replace('♯', '#').replace('♭', 'B')
+    qual = m.group(2).strip().lower()
+    root_semi = NOTE_TO_SEMITONE.get(root_str, -1)
+    if root_semi < 0:
+        return 0.3, "알 수 없는 루트 음", False
+
+    intervals = CHORD_INTERVALS.get(qual, [0, 4, 7])
+    theory_pitches = {(root_semi + semi) % 12 for semi in intervals}
+    if slash_bass and NOTE_TO_SEMITONE.get(slash_bass, -1) >= 0:
+        theory_pitches.add(NOTE_TO_SEMITONE[slash_bass])
+
+    valid_sounding = sounding_pitches.intersection(theory_pitches)
+    theory_match_ratio = len(valid_sounding) / len(sounding_pitches) if sounding_pitches else 0.0
+
+    has_root = (root_semi in sounding_pitches) or (slash_bass and NOTE_TO_SEMITONE.get(slash_bass) in sounding_pitches)
+    theory_score = (theory_match_ratio * 0.7) + (0.3 if has_root else 0.0)
+
+    # 2. 오디오 DSP 피크와의 일치도 (Audio Match)
+    audio_score = 0.6
+    audio_checked = False
+    if dsp_info and isinstance(dsp_info, dict):
+        dom_notes = dsp_info.get("dominant_notes") or []
+        audio_pitches = {NOTE_TO_SEMITONE[n] for n in dom_notes if n in NOTE_TO_SEMITONE}
+        if audio_pitches:
+            audio_checked = True
+            capo_val = _safe_int(dsp_info.get("capo", capo), 1)
+            direct_overlap = len(sounding_pitches.intersection(audio_pitches)) / len(sounding_pitches) if sounding_pitches else 0.0
+            capo_sounding = {(p + capo_val) % 12 for p in sounding_pitches}
+            capo_overlap = len(capo_sounding.intersection(audio_pitches)) / len(capo_sounding) if capo_sounding else 0.0
+            audio_overlap = max(direct_overlap, capo_overlap)
+            raw_sim = float(dsp_info.get("similarity", 0.7))
+            audio_score = (audio_overlap * 0.6) + (raw_sim * 0.4)
+
+    # 3. 종합 점수 산출
+    if audio_checked:
+        total_score = (audio_score * 0.55) + (theory_score * 0.45)
+    else:
+        total_score = theory_score
+
+    total_score = max(0.0, min(1.0, total_score))
+
+    CONFIDENCE_THRESHOLD = 0.65
+    is_confident = total_score >= CONFIDENCE_THRESHOLD
+
+    if is_confident:
+        reason = f"화음 검증 완료 (일치율 {int(total_score * 100)}%)"
+    else:
+        if theory_match_ratio < 0.5:
+            reason = f"비표준 텐션 또는 불협화음 감지 (화성 일치율 {int(theory_match_ratio * 100)}%)"
+        elif audio_checked and audio_score < 0.5:
+            reason = f"오디오 음향 불일치 (음향 일치율 {int(audio_score * 100)}%)"
+        else:
+            reason = f"모호한 파지 형태 (신뢰도 {int(total_score * 100)}% < 65%)"
+
+    return round(total_score, 2), reason, is_confident
+
+
 def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None, dsp_info: dict = None) -> dict:
     """
     AI가 반환한 운지 딕셔너리가 화성학/운지 물리 법칙을 위배할 경우
@@ -610,6 +790,10 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
         fingering_dict["dots"] = []
         fingering_dict["barre"] = None
         return fingering_dict
+
+    dots = fingering_dict.get("dots") or []
+    raw_dots = [d.copy() for d in dots if isinstance(d, dict)]
+    fingering_dict["raw_dots"] = raw_dots
 
     # 0.1 오디오 FFT 실음 기반 프렛 위치 및 코드명 역추산 보정 (카포 1프렛 기준)
     if dsp_info and isinstance(dsp_info, dict):
@@ -796,6 +980,7 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
     # 6-B: E-shape 바레 코드 (6번줄 루트)
     is_e_shape = (barre_fret >= 1 and (TUNING[6] + barre_fret) % 12 == root_semi)
     if is_e_shape:
+        fingering_dict["markers"] = {}
         target_fret = barre_fret + 2
         if quality in ['', 'maj', 'major']:
             fingering_dict["dots"] = [
@@ -845,6 +1030,22 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
                 f"누르는 E형 마이너7 [{clean_name}] 코드 폼입니다."
             )
             return fingering_dict
+        elif quality in ['7', 'dom7']:
+            fingering_dict["dots"] = [
+                {"string": 5, "fret": target_fret, "finger": 3},
+                {"string": 3, "fret": barre_fret + 1, "finger": 2},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 6,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~6번줄) 전체 바레, 약지(3번)로 {target_fret}프렛(5번줄), "
+                f"중지(2번)로 {barre_fret + 1}프렛(3번줄)을 누르는 E형 도미넌트7 [{clean_name}] 코드 폼입니다."
+            )
+            return fingering_dict
 
     # 7. 분수코드 (Slash Chord / Inversion) 자동 검출
     lowest_s, lowest_f, lowest_pitch = detect_lowest_sounding_string(
@@ -883,6 +1084,17 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
                 chord_notes.add(TUNING[_safe_int(s)] % 12)
 
         if root_semi not in chord_notes and (slash_bass is None or NOTE_TO_SEMITONE.get(slash_bass) not in chord_notes):
+            conf_score, conf_reason, is_conf = evaluate_chord_confidence(clean_name, fingering_dict, dsp_info=dsp_info)
+            if not is_conf:
+                # 억지 사전자료 대체 금지: 실제 감지된 손 위치 원형 복원 및 Hand-Only 모드 설정
+                if fingering_dict.get("raw_dots"):
+                    fingering_dict["dots"] = fingering_dict["raw_dots"]
+                fingering_dict["is_confident"] = False
+                fingering_dict["confidence"] = conf_score
+                fingering_dict["confidence_reason"] = conf_reason
+                fingering_dict["chord"] = "-"
+                return fingering_dict
+
             sanitized = resolve_chord_data(clean_name, prefer_fret=prefer_fret or _safe_int(fingering_dict.get("base_fret"), 1))
             barre_info = sanitized.get("barre")
             dots_info = sanitized.get("dots") or []
@@ -904,7 +1116,8 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None, dsp_in
     """
     valid_custom = False
     if fingering_dict and isinstance(fingering_dict, dict):
-        fingering_dict = sanitize_fingering_with_theory(chord_name, fingering_dict, prefer_fret=prefer_fret, dsp_info=dsp_info)
+        cname_to_sanitize = chord_name if chord_name not in ["-", "", None] else fingering_dict.get("chord", "-")
+        fingering_dict = sanitize_fingering_with_theory(cname_to_sanitize, fingering_dict, prefer_fret=prefer_fret, dsp_info=dsp_info)
         dots = fingering_dict.get('dots')
         barre = fingering_dict.get('barre')
         if (isinstance(dots, list) and len(dots) > 0) or (isinstance(barre, dict) and barre.get('fret')):
@@ -955,7 +1168,9 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None, dsp_in
         f'box-shadow: 0 4px 12px rgba(0,0,0,0.12); border: 1.5px solid #CBD5E1;">'
     ]
 
-    display_title = str(data.get('chord') or chord_name)
+    display_title = str(data.get('chord') or chord_name or "")
+    if display_title in ["-", "None", "", "알 수 없음", "미상"]:
+        display_title = f"{base_fret} Fret Shape" if base_fret > 1 else "Custom Shape"
     svg.append(
         f'<text x="{start_x}" y="24" font-size="17" font-weight="800" fill="#0F1720">{display_title}</text>'
     )
@@ -1087,6 +1302,16 @@ def parse_ai_response(text: str, prefer_fret: int = None, dsp_info: dict = None)
         detected_chord = str(fingering_dict.get("chord") or "C").strip()
         fingering_dict = sanitize_fingering_with_theory(detected_chord, fingering_dict, prefer_fret=prefer_fret, dsp_info=dsp_info)
         detected_chord = str(fingering_dict.get("chord") or detected_chord).strip()
+
+        # 신뢰도 평가 게이트 실행 (Confidence Gate)
+        confidence, reason, is_confident = evaluate_chord_confidence(detected_chord, fingering_dict, dsp_info=dsp_info)
+        fingering_dict["is_confident"] = is_confident
+        fingering_dict["confidence"] = confidence
+        fingering_dict["confidence_reason"] = reason
+
+        sounding_pitches, string_notes = get_sounding_pitches(fingering_dict)
+        pitch_guide = ", ".join([f"{s}번줄:{p}" for s, p in sorted(string_notes.items())])
+
         summary = str(fingering_dict.get("fingering_summary") or "").strip()
         visual_obs = str(fingering_dict.get("finger_observations") or "").strip()
         prefer_fret = _safe_int(fingering_dict.get("base_fret"), prefer_fret)
@@ -1117,15 +1342,40 @@ def parse_ai_response(text: str, prefer_fret: int = None, dsp_info: dict = None)
                             fn = "엄지(T)"
                         parts.append(f"{fn}로 {d['string']}번 줄 {d['fret']}프렛")
             if parts:
-                summary = f"{', '.join(parts)}을 운지하는 [{detected_chord}] 코드 폼입니다."
+                if is_confident and detected_chord not in ["-", "", "None"]:
+                    summary = f"{', '.join(parts)}을 운지하는 [{detected_chord}] 코드 폼입니다."
+                else:
+                    summary = f"{', '.join(parts)} 파지 형태입니다."
             else:
                 summary = f"[{detected_chord}] 코드의 기본 운지 형태입니다."
 
+        # Mode B: 신뢰도 미달(0.65 미만) 또는 미상 보이싱 시 손 위치 전용(Hand-Only) 리포트 출력
+        if not is_confident or detected_chord in ["-", "", "None"]:
+            detected_chord = "-"
+            fingering_dict["chord"] = "-"
+            if fingering_dict.get("raw_dots"):
+                fingering_dict["dots"] = fingering_dict["raw_dots"]
+            sounding_pitches, string_notes = get_sounding_pitches(fingering_dict)
+            pitch_guide = ", ".join([f"{s}번줄:{p}" for s, p in sorted(string_notes.items())])
+            clean_markdown = (
+                f"1. **코드명**: **특수 보이싱 / 미상 (-)**\n"
+                f"2. **지판 위치 및 운지 요약**: 계산 신뢰도가 낮거나 비표준 폼으로 판별되어 억지 코드명을 부여하지 않고, "
+                f"영상에서 포착된 **실제 손가락 파지 위치**를 다이어그램으로 표시합니다.\n"
+                f"- **파지 운지**: {summary}\n"
+                f"- **각 현별 실음**: {pitch_guide if pitch_guide else '뮤트 또는 개방현'}\n"
+                f"- **분석 상태**: {reason}"
+            )
+            return clean_markdown, detected_chord, fingering_dict, prefer_fret
+
+        # Mode A: 확정 코드 모드 리포트 출력
         reconcile_note = fingering_dict.get("reconciliation_note")
         clean_markdown = (
             f"1. **정확한 코드명**: **{detected_chord}**\n"
-            f"2. **지판 위치 및 운지 요약**: {summary}"
+            f"2. **지판 위치 및 운지 요약**: {summary}\n"
+            f"- **분석 신뢰도**: {int(confidence * 100)}% ({reason})"
         )
+        if pitch_guide:
+            clean_markdown += f"\n- **구성 음정**: {pitch_guide}"
         if reconcile_note:
             clean_markdown += f"\n- **정밀 화성 역추산**: {reconcile_note}"
         return clean_markdown, detected_chord, fingering_dict, prefer_fret
