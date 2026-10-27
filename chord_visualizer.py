@@ -22,6 +22,11 @@ NOTE_TO_SEMITONE = {
 }
 
 OPEN_CHORD_DB = {
+    'MUTE': {
+        'base_fret': 1,
+        'dots': [],
+        'markers': {1: 'x', 2: 'x', 3: 'x', 4: 'x', 5: 'x', 6: 'x'}
+    },
     'C': {
         'base_fret': 1,
         'dots': [
@@ -434,6 +439,13 @@ def resolve_chord_data(chord_name, prefer_fret=None):
     if (prefer_fret is None or prefer_fret <= 3) and upper_key in OPEN_CHORD_DB:
         return OPEN_CHORD_DB[upper_key]
 
+    if 'MUTE' in upper_key or '뮤트' in clean:
+        base_match = re.match(r'^([A-G][#b♯♭]?[^\s\(]*)', clean, re.IGNORECASE)
+        if base_match:
+            base_chord = base_match.group(1).strip()
+            return resolve_chord_data(base_chord, prefer_fret=prefer_fret)
+        return OPEN_CHORD_DB['MUTE']
+
     m = re.match(r'^([A-G][#b♯♭]?)(.*)$', clean_main, re.IGNORECASE)
     if not m:
         return OPEN_CHORD_DB.get('C')
@@ -473,12 +485,32 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
         return fingering_dict
 
     clean_name = str(chord_name or "").strip()
+    # 0. Mute (뮤트) 코드 처리
+    if 'mute' in clean_name.lower() or '뮤트' in clean_name:
+        if not fingering_dict.get("markers"):
+            fingering_dict["markers"] = {1: 'x', 2: 'x', 3: 'x', 4: 'x', 5: 'x', 6: 'x'}
+        return fingering_dict
+
     m = re.match(r'^([A-G][#b♯♭]?)(.*)$', clean_name, re.IGNORECASE)
     if not m:
         return fingering_dict
 
     root_str = m.group(1).upper().replace('♯', '#').replace('♭', 'B')
     quality = m.group(2).strip().lower()
+
+    # 0.5. 엄지 썸오버 6번줄 2프렛 파지 시 Bm7 오판정 자동 교정:
+    # 6번줄 2프렛에 엄지(T)가 위치하는 경우 이는 물리적으로 F# 계열(F#7/F#m7) 운지입니다.
+    dots = fingering_dict.get("dots") or []
+    has_thumb_fsharp = any(
+        (str(d.get("finger")).upper() == "T" or d.get("finger") == 1) and
+        _safe_int(d.get("string")) == 6 and _safe_int(d.get("fret")) == 2
+        for d in dots if isinstance(d, dict)
+    )
+    if has_thumb_fsharp and root_str == "B":
+        clean_name = "F#7"
+        fingering_dict["chord"] = "F#7"
+        root_str = "F#"
+        quality = "7"
 
     # 1. markers 정리: 'x', 'o' 이외의 숫자(프렛 번호) 등이 들어있으면 필터링
     if isinstance(fingering_dict.get("markers"), dict):

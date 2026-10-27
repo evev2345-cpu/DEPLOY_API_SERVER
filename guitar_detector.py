@@ -386,13 +386,14 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
             color = finger_colors[f_num]
             c_pts = [(pts[i][0] - x1, pts[i][1] - y1) for i in chain]
             
-            # 해부학적 관절 길이 비율 제한 (PIP-TIP 거리가 MCP-PIP 길이의 1.15배를 초과하지 못하도록 클램핑)
+            # 해부학적 관절 길이 비율 제한 (중지는 0.78배, 기타 손가락은 0.90배로 제한하여 손가락이 윗줄로 기괴하게 치솟는 현상 방지)
             mcp_p, pip_p, tip_p = c_pts[0], c_pts[1], c_pts[3]
             l_prox = math.hypot(pip_p[0] - mcp_p[0], pip_p[1] - mcp_p[1])
+            max_ratio = 0.78 if f_num == 2 else 0.90
             if l_prox > 5.0:
                 l_dist = math.hypot(tip_p[0] - pip_p[0], tip_p[1] - pip_p[1])
-                if l_dist > l_prox * 1.15:
-                    ratio = (l_prox * 1.10) / l_dist
+                if l_dist > l_prox * max_ratio:
+                    ratio = (l_prox * max_ratio) / l_dist
                     c_pts[3] = (
                         pip_p[0] + (tip_p[0] - pip_p[0]) * ratio,
                         pip_p[1] + (tip_p[1] - pip_p[1]) * ratio,
