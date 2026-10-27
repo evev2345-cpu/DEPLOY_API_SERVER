@@ -270,7 +270,6 @@ def build_vision_first_prompt(hand_section: str, dsp_section: str) -> str:
         "  \"chord\": \"위 시각적 손가락 위치로 만들어지는 최종 코드명 (예: F#7, F#m7, Bm7, G, A, Em, C 등)\"\n"
         "}"
     )
-    )
 
 
 def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
