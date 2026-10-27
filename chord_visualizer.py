@@ -454,7 +454,7 @@ def _safe_int(val, default=1):
         return default
 
 
-def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict) -> dict:
+def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None) -> dict:
     """
     AI가 반환한 운지 딕셔너리가 화성학/운지 물리 법칙을 위배할 경우
     (예: 7(#5) 코드에서 4번줄을 Maj7 프렛으로 짚거나 웅크린 새끼손가락을 짚었다고 오인하는 경우)
@@ -512,6 +512,45 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict) -> dic
             )
             return fingering_dict
 
+    # 3. 루트 음(Root Note) 정합성 검증:
+    # 손가락 아치 굴곡(자가 가림)으로 인해 비전 모델이 엉뚱한 줄 번호를 환각하여
+    # 해당 코드의 근음(Root)조차 포함되지 않은 비정상 운지인 경우 정규 표준 코드 보이싱으로 대체
+    dots = fingering_dict.get("dots") or []
+    barre = fingering_dict.get("barre")
+    if dots or barre:
+        tuning = {6: 4, 5: 9, 4: 2, 3: 7, 2: 11, 1: 4}
+        root_semi = NOTE_TO_SEMITONE.get(root_str, -1)
+        if root_semi >= 0:
+            chord_notes = set()
+            if isinstance(barre, dict) and _safe_int(barre.get("fret"), 0) > 0:
+                bfret = _safe_int(barre["fret"])
+                b_start = _safe_int(barre.get("start_string"), 1)
+                b_end = _safe_int(barre.get("end_string"), 6)
+                for s in range(min(b_start, b_end), max(b_start, b_end) + 1):
+                    chord_notes.add((tuning[s] + bfret) % 12)
+            for d in dots:
+                if isinstance(d, dict) and _safe_int(d.get("string")) in tuning:
+                    chord_notes.add((tuning[d["string"]] + _safe_int(d.get("fret"))) % 12)
+
+            markers = fingering_dict.get("markers") or {}
+            for s, m in markers.items():
+                if str(m).lower() in ["o", "0", "open"] and int(s) in tuning:
+                    chord_notes.add(tuning[int(s)] % 12)
+
+            if root_semi not in chord_notes:
+                # 근음조차 없는 환각 운지이므로 정규 표준 코드 보이싱으로 대체
+                sanitized = resolve_chord_data(clean_name, prefer_fret=prefer_fret or _safe_int(fingering_dict.get("base_fret"), 1))
+                barre_info = sanitized.get("barre")
+                dots_info = sanitized.get("dots") or []
+                desc_parts = []
+                if barre_info:
+                    desc_parts.append(f"검지가 {barre_info.get('fret', 1)}프렛 바레")
+                dot_strs = [f"{d.get('string')}번줄 {d.get('fret')}프렛" for d in dots_info if isinstance(d, dict)]
+                if dot_strs:
+                    desc_parts.append(f"{', '.join(dot_strs)} 운지")
+                sanitized["fingering_summary"] = f"카포 1프렛 기준 {clean_name} 표준 폼 연주 ({', '.join(desc_parts)})"
+                return sanitized
+
     return fingering_dict
 
 
@@ -521,7 +560,7 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None):
     """
     valid_custom = False
     if fingering_dict and isinstance(fingering_dict, dict):
-        fingering_dict = sanitize_fingering_with_theory(chord_name, fingering_dict)
+        fingering_dict = sanitize_fingering_with_theory(chord_name, fingering_dict, prefer_fret=prefer_fret)
         dots = fingering_dict.get('dots')
         barre = fingering_dict.get('barre')
         if (isinstance(dots, list) and len(dots) > 0) or (isinstance(barre, dict) and barre.get('fret')):
