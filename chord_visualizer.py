@@ -605,6 +605,57 @@ def reconcile_fret_with_audio(chord_name: str, fingering_dict: dict, dsp_info: d
                 )
                 return new_chord, fingering_dict
 
+        # 1-B. 화성 퀄리티(Quality: Major vs Minor vs 7th) 불일치 교정
+        # 같은 프렛/루트인데 비전 AI가 F#m7처럼 메이저/마이너를 잘못 라벨링한 경우
+        if fretboard_semi == v_semi and v_qual != a_qual:
+            dots = fingering_dict.get('dots') or []
+            barre = fingering_dict.get('barre') or {}
+            bfret = _safe_int(barre.get('fret'), 0) if isinstance(barre, dict) else 0
+
+            # E형 바레 폼인 경우 (6번줄 루트)
+            if bfret > 0 and (TUNING[6] + bfret) % 12 == fretboard_semi:
+                # 3번줄에 (bfret + 1) 프렛 운지가 있는지 확인 -> 장3도 (Major 3rd)
+                has_major_3rd = any(
+                    _safe_int(d.get('string')) == 3 and _safe_int(d.get('fret')) == bfret + 1
+                    for d in dots if isinstance(d, dict)
+                )
+
+                # 오디오가 Major를 가리키거나 지판에 장3도가 확실히 찍혀있는 경우
+                if (a_qual in ['', 'maj', 'major', 'add9', 'maj7', '5'] or has_major_3rd) and has_major_3rd:
+                    new_chord = fretboard_root
+                    fingering_dict['chord'] = new_chord
+                    fingering_dict['reconciliation_note'] = (
+                        f"지판 3번줄 {bfret + 1}프렛(장3도 음정) 운지 및 오디오 실음({tc}) 분석을 통해, "
+                        f"비전 모델의 오판[{chord_name}]을 정규 메이저 [{new_chord}] 코드로 자동 교정했습니다."
+                    )
+                    return new_chord, fingering_dict
+
+                # 오디오가 Minor/m7을 가리키고 3번줄 장3도가 없는 경우
+                if a_qual in ['m', 'min', 'minor', 'm7', 'min7'] and not has_major_3rd:
+                    target_q = 'm7' if '7' in (v_qual + a_qual) else 'm'
+                    new_chord = f"{fretboard_root}{target_q}"
+                    fingering_dict['chord'] = new_chord
+                    fingering_dict['reconciliation_note'] = (
+                        f"지판 단3도 바레 음정 및 오디오 실음({tc}) 분석을 통해 [{new_chord}] 코드로 자동 교정했습니다."
+                    )
+                    return new_chord, fingering_dict
+
+            # A형 바레 폼인 경우 (5번줄 루트)
+            if bfret > 0 and (TUNING[5] + bfret) % 12 == fretboard_semi:
+                # 2번줄에 (bfret + 1) 프렛 운지가 있는지 확인 -> 단3도 (Minor 3rd)
+                has_minor_3rd = any(
+                    _safe_int(d.get('string')) == 2 and _safe_int(d.get('fret')) == bfret + 1
+                    for d in dots if isinstance(d, dict)
+                )
+                if (a_qual in ['m', 'min', 'minor', 'm7'] or has_minor_3rd) and has_minor_3rd:
+                    target_q = 'm7' if '7' in (v_qual + a_qual) else 'm'
+                    new_chord = f"{fretboard_root}{target_q}"
+                    fingering_dict['chord'] = new_chord
+                    fingering_dict['reconciliation_note'] = (
+                        f"지판 2번줄 {bfret + 1}프렛(단3도 음정) 운지 및 오디오 실음({tc})을 바탕으로 [{new_chord}] 코드로 자동 교정했습니다."
+                    )
+                    return new_chord, fingering_dict
+
         # 화성 퀄리티 상호 호환성 검증 (m7, minor, major 등)
         qual_compat = (
             (v_qual == a_qual) or
