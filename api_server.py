@@ -302,20 +302,23 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
                 q = tc[len(r):]
                 idx = scale_12.index(r)
                 transposed_chord = scale_12[(idx - 1) % 12] + q
-                capo_candidates.append(f"{transposed_chord} (실음: {tc})")
+                capo_candidates.append(f"{transposed_chord} (울리는 실음: {tc})")
                 break
 
-    transposed_hint = f"- 카포 1프렛 장착 시 오디오 화성 후보군: {', '.join(capo_candidates)}" if capo_candidates else ""
+    candidate_bullet_list = "\n".join([f"  * {c}" for c in capo_candidates]) if capo_candidates else "  * (분석 화음 없음)"
 
     hand_section = f"\n{hand_info['hand_summary_text']}\n" if hand_info.get("hand_summary_text") else ""
-    if dsp_info.get("summary_text"):
+    if dsp_info.get("active_notes"):
+        notes_list_str = ", ".join(dsp_info.get("active_notes", [])[:5])
         dsp_section = (
             f"\n[오디오 주파수(FFT) 및 화성학 정밀 분석 (절대적 근거)]\n"
-            f"{dsp_info['summary_text']}\n"
-            f"- **오디오 화성학 및 카포(Capo) 역산 원리**:\n"
-            f"  * 기타 넥에 카포가 장착된 경우, 연주자가 실제로 지판에서 짚고 있는 운지 폼은 실음에서 카포 프렛 수만큼 반음을 내린 코드입니다.\n"
-            f"  {transposed_hint}\n"
-            f"  * 위 오디오 후보군 중에서 이미지 2(운지 클로즈업)에서 연주자의 손가락이 실제로 누르고 있는 프렛(2프렛 바레 등)과 시각적으로 완벽히 일치하는 코드를 최종 코드로 선택하세요!\n"
+            f"- 검출된 주요 구성 음정: {notes_list_str}\n"
+            f"- **카포 1프렛 장착 시 운지 코드 폼 후보군 (최우선 선택지)**:\n"
+            f"{candidate_bullet_list}\n"
+            f"- **필수 준수 지침**:\n"
+            f"  * 기타 넥에 카포 1프렛이 장착되어 있으므로, 최종 코드명(chord)에는 반드시 위 역산 운지 폼(예: F#7, F#m7, Bm7, A, G 등)을 입력해야 합니다!\n"
+            f"  * 절대 콘서트 피치 실음(G7, Gm7, Ab7, Cm7 등)을 최종 코드명(chord)에 입력하지 마세요!\n"
+            f"  * 이미지 2(운지 클로즈업)에서 연주자의 손가락이 짚고 있는 실제 프렛(예: 2프렛 바레 등)과 위 후보군을 교차 검증하여 시각적으로 완벽히 일치하는 운지 코드를 선택하세요!\n"
         )
     elif mode == "image":
         dsp_section = "\n[오디오 정보: 단일 사진 분석 모드로 오디오 없음 (지판 시각 관찰 최우선 판별)]\n"
@@ -336,12 +339,25 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
     # 사운드 분석 근거 명시 보강 (판별된 코드에 상응하는 실음 화성 동적 매칭)
     if dsp_info.get("active_notes"):
         real_sound = ""
-        for r in ["C#", "Eb", "F#", "Ab", "Bb", "C", "D", "E", "F", "G", "A", "B"]:
-            if detected_chord.startswith(r):
-                q = detected_chord[len(r):].replace(" (Capo 1)", "").replace(" (Capo 2)", "")
-                idx = scale_12.index(r)
-                real_sound = scale_12[(idx + 1) % 12] + q
+        # 1. dsp_info top_chords에서 직접 매칭 확인 (가장 정확한 음향 실음)
+        for tc in dsp_info.get("top_chords", []):
+            for r in ["C#", "Eb", "F#", "Ab", "Bb", "C", "D", "E", "F", "G", "A", "B"]:
+                if tc.startswith(r):
+                    q = tc[len(r):]
+                    idx = scale_12.index(r)
+                    if scale_12[(idx - 1) % 12] + q == detected_chord.replace(" (Capo 1)", "").replace(" (Capo 2)", ""):
+                        real_sound = tc
+                        break
+            if real_sound:
                 break
+        # 2. 직접 매칭 실패 시 detected_chord + 1반음 계산
+        if not real_sound:
+            for r in ["C#", "Eb", "F#", "Ab", "Bb", "C", "D", "E", "F", "G", "A", "B"]:
+                if detected_chord.startswith(r):
+                    q = detected_chord[len(r):].replace(" (Capo 1)", "").replace(" (Capo 2)", "")
+                    idx = scale_12.index(r)
+                    real_sound = scale_12[(idx + 1) % 12] + q
+                    break
         if not real_sound:
             real_sound = dsp_info.get("top_chords", [""])[0] if dsp_info.get("top_chords") else ""
 

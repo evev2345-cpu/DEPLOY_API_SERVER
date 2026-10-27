@@ -24,6 +24,7 @@ MODEL_PATH = os.path.join(os.path.dirname(os.path.abspath(__file__)), "hand_land
 
 _LANDMARKER = None
 _LANDMARKER_ERROR = None
+_DETECT_ERROR = None
 _LANDMARKER_LOCK = threading.Lock()
 _CLAHE = cv2.createCLAHE(clipLimit=1.6, tileGridSize=(8, 8))
 
@@ -262,7 +263,9 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
                         for p in lm
                     ]
                     break
-            except Exception:
+            except Exception as e:
+                global _DETECT_ERROR
+                _DETECT_ERROR = f"MediaPipe detect 오류: {e}"
                 continue
 
         # 만약 넥 후보 영역에서 미검출 시, 피부색 패치 및 풀 프레임 탐색
@@ -277,7 +280,8 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
                         res = landmarker.detect(mp_img)
                     if res.hand_landmarks:
                         fretting_lm, picking_lm = _select_fretting_hand(res.hand_landmarks, res.handedness, w, h)
-                except Exception:
+                except Exception as e:
+                    _DETECT_ERROR = f"MediaPipe full detect 오류: {e}"
                     pass
 
     if fretting_lm is None and picking_lm is not None:
@@ -410,8 +414,8 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
         }
 
     # Fallback: MediaPipe가 손 관절을 못 찾은 경우에도 절대 전체 프레임이나 하단 자막을 포함하지 않고,
-    # 넥 지판 영역을 타이트하게 크롭하고 운지 손 영역을 안내
-    x1, y1, x2, y2 = int(w * 0.45), int(h * 0.05), int(w * 0.95), int(h * 0.65)
+    # 넥 지판 영역(y: 20%~65%, x: 45%~92%)을 타이트하게 크롭하고 운지 손 영역을 안내
+    x1, y1, x2, y2 = int(w * 0.45), int(h * 0.20), int(w * 0.92), int(h * 0.65)
     clean_crop_rgb = rgb[y1:y2, x1:x2]
     clean_zoom_pil = enhance_fretboard_roi(clean_crop_rgb)
     annotated_zoom_pil = clean_zoom_pil.copy()
@@ -421,7 +425,10 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
         ycrcb_c = cv2.cvtColor(clean_crop_rgb, cv2.COLOR_RGB2YCrCb)
         skin_c = cv2.inRange(ycrcb_c, np.array([0, 133, 77], dtype=np.uint8), np.array([255, 173, 127], dtype=np.uint8))
         cnts_c, _ = cv2.findContours(skin_c, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        hand_cnts = [c for c in cnts_c if cv2.contourArea(c) > 300]
+        hand_cnts = [
+            c for c in cnts_c
+            if cv2.contourArea(c) > 400 and cv2.boundingRect(c)[1] > 5 and cv2.boundingRect(c)[3] > 35
+        ]
         
         draw = ImageDraw.Draw(annotated_zoom_pil)
         if hand_cnts:
@@ -439,7 +446,7 @@ def analyze_and_crop_guitar_hand(pil_img: Image.Image) -> dict:
         "annotated_zoom_pil": annotated_zoom_pil,
         "box_1000": box_1000,
         "hand_summary_text": "- **운지 시각 관찰 모드**: 지판 위 운지 손 고해상도 확대 이미지가 제공됩니다. 손가락이 누른 줄과 프렛을 직접 확인하여 판별하세요.",
-        "landmarker_error": _LANDMARKER_ERROR,
+        "landmarker_error": _DETECT_ERROR or _LANDMARKER_ERROR,
     }
 
 
