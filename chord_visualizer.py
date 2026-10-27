@@ -21,6 +21,24 @@ NOTE_TO_SEMITONE = {
     'B': 11, 'CB': 11,
 }
 
+SEMITONE_TO_NOTE = ['C', 'C#', 'D', 'D#', 'E', 'F', 'F#', 'G', 'G#', 'A', 'Bb', 'B']
+
+TUNING = {6: 4, 5: 9, 4: 2, 3: 7, 2: 11, 1: 4}
+
+CHORD_INTERVALS = {
+    '': [0, 4, 7], 'maj': [0, 4, 7], 'major': [0, 4, 7],
+    'm': [0, 3, 7], 'min': [0, 3, 7], 'minor': [0, 3, 7], '-': [0, 3, 7],
+    '7': [0, 4, 7, 10], 'dom7': [0, 4, 7, 10],
+    'maj7': [0, 4, 7, 11], 'm7': [0, 3, 7, 10], 'min7': [0, 3, 7, 10], '-7': [0, 3, 7, 10],
+    'mmaj7': [0, 3, 7, 11],
+    'dim': [0, 3, 6], 'dim7': [0, 3, 6, 9], 'm7b5': [0, 3, 6, 10], 'm7(b5)': [0, 3, 6, 10],
+    'aug': [0, 4, 8], 'aug7': [0, 4, 8, 10], '7aug': [0, 4, 8, 10], '7#5': [0, 4, 8, 10], '7(#5)': [0, 4, 8, 10], '+7': [0, 4, 8, 10],
+    'sus4': [0, 5, 7], 'sus2': [0, 2, 7], '7sus4': [0, 5, 7, 10],
+    '6': [0, 4, 7, 9], 'm6': [0, 3, 7, 9], 'add9': [0, 2, 4, 7], '9': [0, 2, 4, 7, 10],
+    'maj9': [0, 2, 4, 7, 11], 'm9': [0, 2, 3, 7, 10], '7b9': [0, 1, 4, 7, 10], '7#9': [0, 3, 4, 7, 10],
+    '11': [0, 2, 4, 5, 7, 10], '13': [0, 2, 4, 7, 9, 10]
+}
+
 OPEN_CHORD_DB = {
     'MUTE': {
         'base_fret': 1,
@@ -475,11 +493,45 @@ def _format_finger(f_val):
     return '1'
 
 
-def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None) -> dict:
+def detect_lowest_sounding_string(dots, barre, markers):
+    """
+    기타의 6번줄(최저음)부터 1번줄(최고음)까지 검사하여
+    뮤트('x')되지 않고 실제로 울리는 가장 낮은 줄 번호, 프렛 번호, 음계(Pitch Class)를 반환합니다.
+    """
+    markers = markers or {}
+    dots = dots or []
+    for s in [6, 5, 4, 3, 2, 1]:
+        m = markers.get(s) or markers.get(str(s))
+        if str(m).lower() in ['x', 'mute']:
+            continue
+
+        fret = None
+        for d in dots:
+            if isinstance(d, dict) and _safe_int(d.get('string')) == s:
+                fret = _safe_int(d.get('fret'))
+                break
+
+        if fret is None and isinstance(barre, dict) and _safe_int(barre.get('fret'), 0) > 0:
+            b_start = min(_safe_int(barre.get('start_string', 1)), _safe_int(barre.get('end_string', 6)))
+            b_end = max(_safe_int(barre.get('start_string', 1)), _safe_int(barre.get('end_string', 6)))
+            if b_start <= s <= b_end:
+                fret = _safe_int(barre.get('fret'))
+
+        if fret is None and str(m).lower() in ['o', 'open', '0']:
+            fret = 0
+
+        if fret is not None:
+            pitch = (TUNING[s] + fret) % 12
+            return s, fret, pitch
+    return None, None, None
+
+
+def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer_fret: int = None, dsp_info: dict = None) -> dict:
     """
     AI가 반환한 운지 딕셔너리가 화성학/운지 물리 법칙을 위배할 경우
-    (예: 7(#5) 코드에서 4번줄을 Maj7 프렛으로 짚거나 웅크린 새끼손가락을 짚었다고 오인하는 경우)
-    해당 코드의 정확한 물리적/화성학적 운지로 자동 보정합니다.
+    (예: B코드에서 4번줄 3프렛 감5도 불협화음 환각, 공중에 뜬 2/4번 손가락 착오, A형/E형 바레 폼 누락 등)
+    전 지판 음계 룩업테이블(LUT) 및 음향 FFT 교차 검증을 통해 정확한 물리적/화성학적 운지로 자동 보정합니다.
+    분수코드(Slash chord) 및 텐션 보이싱을 자동 합성하고 감지합니다.
     """
     if not isinstance(fingering_dict, dict):
         return fingering_dict
@@ -489,18 +541,40 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
     if 'mute' in clean_name.lower() or '뮤트' in clean_name:
         if not fingering_dict.get("markers"):
             fingering_dict["markers"] = {1: 'x', 2: 'x', 3: 'x', 4: 'x', 5: 'x', 6: 'x'}
+        fingering_dict["dots"] = []
+        fingering_dict["barre"] = None
         return fingering_dict
 
-    m = re.match(r'^([A-G][#b♯♭]?)(.*)$', clean_name, re.IGNORECASE)
+    # Capo 등 부가 텍스트 제거 및 분수코드 분리
+    clean_name = re.sub(r'\(.*?\)', '', clean_name).strip()
+    slash_parts = clean_name.split('/')
+    main_chord = slash_parts[0].strip()
+    slash_bass = slash_parts[1].strip().upper().replace('♯', '#').replace('♭', 'B') if len(slash_parts) > 1 else None
+
+    m = re.match(r'^([A-G][#b♯♭]?)(.*)$', main_chord, re.IGNORECASE)
     if not m:
         return fingering_dict
 
     root_str = m.group(1).upper().replace('♯', '#').replace('♭', 'B')
     quality = m.group(2).strip().lower()
 
-    # 0.5. 엄지 썸오버 6번줄 2프렛 파지 시 Bm7 오판정 자동 교정:
+    root_semi = NOTE_TO_SEMITONE.get(root_str, -1)
+    if root_semi < 0:
+        return fingering_dict
+
+    # 1. markers 정리: 'x', 'o' 이외의 숫자나 불필요한 값 정리
+    if isinstance(fingering_dict.get("markers"), dict):
+        clean_m = {}
+        for k, v in fingering_dict["markers"].items():
+            v_s = str(v).strip().lower()
+            if v_s in ['x', 'mute']:
+                clean_m[_safe_int(k)] = 'x'
+            elif v_s in ['o', 'open', '0']:
+                clean_m[_safe_int(k)] = 'o'
+        fingering_dict["markers"] = clean_m
+
+    # 2. 엄지 썸오버 6번줄 2프렛 파지 시 Bm7 오판정 자동 교정:
     # 6번줄 2프렛에 엄지(T)가 위치하는 경우 이는 물리적으로 F# 계열(F#7/F#m7) 운지입니다.
-    # 단, B 메이저(A형 바레 코드: 검지 2프렛, 약지 4프렛)와 혼동되지 않도록 엄지(T)가 명시되고 B 마이너 계열일 때만 적용합니다.
     dots = fingering_dict.get("dots") or []
     has_thumb_fsharp = any(
         str(d.get("finger")).upper() in ["T", "THUMB"] and
@@ -511,33 +585,19 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
         clean_name = "F#7"
         fingering_dict["chord"] = "F#7"
         root_str = "F#"
+        root_semi = NOTE_TO_SEMITONE["F#"]
         quality = "7"
+        main_chord = "F#7"
 
-    # 1. markers 정리: 'x', 'o' 이외의 숫자(프렛 번호) 등이 들어있으면 필터링
-    if isinstance(fingering_dict.get("markers"), dict):
-        clean_m = {}
-        for k, v in fingering_dict["markers"].items():
-            v_s = str(v).strip().lower()
-            if v_s in ['x', 'mute']:
-                clean_m[int(k)] = 'x'
-            elif v_s in ['o', 'open', '0']:
-                clean_m[int(k)] = 'o'
-        fingering_dict["markers"] = clean_m
-
-    # 2. 7(#5) / 7aug / +7 계열 보정
+    # 3. 7(#5) / 7aug / +7 계열 특화 보이싱 보정
     if any(q in quality for q in ['7#5', '7(#5)', '7aug', 'aug7', '+7', '7b13', '7(b13)']):
-        dots = fingering_dict.get("dots") or []
-        root_semi = NOTE_TO_SEMITONE.get(root_str, 0)
         fret_6 = (root_semi - 4) % 12
         if fret_6 == 0:
             fret_6 = 12
 
-        has_6th_root = any(d.get("string") == 6 for d in dots if isinstance(d, dict))
+        has_6th_root = any(_safe_int(d.get("string")) == 6 for d in dots if isinstance(d, dict))
         base_fret_in = _safe_int(fingering_dict.get("base_fret"), 0)
         if has_6th_root or base_fret_in in [fret_6, fret_6 - 1]:
-            # 6번줄 루트 7(#5)의 정석 운지:
-            # 6th(fret_6, finger 1), 4th(fret_6, finger 1), 3rd(fret_6+1, finger 2), 2nd(fret_6+1, finger 3)
-            # 5번줄, 1번줄 뮤트. 새끼손가락(4번)은 사용하지 않음
             fingering_dict["base_fret"] = fret_6
             fingering_dict["barre"] = None
             fingering_dict["dots"] = [
@@ -554,55 +614,195 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
             )
             return fingering_dict
 
-    # 3. 루트 음(Root Note) 정합성 검증:
-    # 손가락 아치 굴곡(자가 가림)으로 인해 비전 모델이 엉뚱한 줄 번호를 환각하여
-    # 해당 코드의 근음(Root)조차 포함되지 않은 비정상 운지인 경우 정규 표준 코드 보이싱으로 대체
+    # 4. 허용 음계(Pitch-Class) 계산 및 오디오 검증 결합
+    intervals = CHORD_INTERVALS.get(quality, [0, 4, 7] if 'm' not in quality else [0, 3, 7])
+    allowed_semis = {(root_semi + semi) % 12 for semi in intervals}
+    if slash_bass and slash_bass in NOTE_TO_SEMITONE:
+        allowed_semis.add(NOTE_TO_SEMITONE[slash_bass])
+
+    # DSP 오디오 FFT에서 검출된 실음 추가
+    if dsp_info and isinstance(dsp_info, dict):
+        for n in dsp_info.get("active_notes", []):
+            clean_n = n.upper().replace('♯', '#').replace('♭', 'B')
+            if clean_n in NOTE_TO_SEMITONE:
+                allowed_semis.add(NOTE_TO_SEMITONE[clean_n])
+
+    # 5. 공중에 뜬 손가락(Floating Fingers) 및 화성학적 불협화음 필터링
+    barre = fingering_dict.get("barre")
+    barre_fret = _safe_int(barre.get("fret"), 0) if isinstance(barre, dict) else 0
+
+    valid_dots = []
+    for d in dots:
+        if not isinstance(d, dict):
+            continue
+        s_num = _safe_int(d.get("string"))
+        f_num = _safe_int(d.get("fret"))
+        if s_num in TUNING and f_num > 0:
+            pitch = (TUNING[s_num] + f_num) % 12
+            if pitch in allowed_semis:
+                valid_dots.append(d)
+        else:
+            valid_dots.append(d)
+
+    fingering_dict["dots"] = valid_dots
+
+    # 6. 바레 코드 정규화 (A형 / E형 바레 폼)
+    # 6-A: A-shape 바레 코드 (5번줄 루트)
+    is_a_shape = (barre_fret >= 1 and (TUNING[5] + barre_fret) % 12 == root_semi)
+    if is_a_shape:
+        target_fret = barre_fret + 2
+        markers = fingering_dict.get("markers") or {}
+        markers[6] = 'x'
+        fingering_dict["markers"] = markers
+
+        if quality in ['', 'maj', 'major']:
+            fingering_dict["dots"] = [
+                {"string": 4, "fret": target_fret, "finger": 3},
+                {"string": 3, "fret": target_fret, "finger": 3},
+                {"string": 2, "fret": target_fret, "finger": 3},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 5,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~5번줄) 바레, 약지(3번)로 {target_fret}프렛의 4, 3, 2번줄을 "
+                f"동시에 누르는 A형 바레 {clean_name} 코드 폼입니다. (6번줄 뮤트)"
+            )
+            return fingering_dict
+        elif quality in ['m', 'min', 'minor', '-']:
+            fingering_dict["dots"] = [
+                {"string": 4, "fret": target_fret, "finger": 3},
+                {"string": 3, "fret": target_fret, "finger": 4},
+                {"string": 2, "fret": barre_fret + 1, "finger": 2},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 5,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~5번줄) 바레, 약지(3번)·새끼(4번)로 {target_fret}프렛(4, 3번줄), "
+                f"중지(2번)로 {barre_fret + 1}프렛(2번줄)을 누르는 {clean_name} 마이너 코드 폼입니다."
+            )
+            return fingering_dict
+        elif quality in ['7', 'dom7']:
+            fingering_dict["dots"] = [
+                {"string": 4, "fret": target_fret, "finger": 3},
+                {"string": 2, "fret": target_fret, "finger": 4},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 5,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~5번줄) 바레, 약지(3번)로 4번줄 {target_fret}프렛, "
+                f"새끼(4번)로 2번줄 {target_fret}프렛을 누르는 {clean_name} 도미넌트7 코드 폼입니다."
+            )
+            return fingering_dict
+
+    # 6-B: E-shape 바레 코드 (6번줄 루트)
+    is_e_shape = (barre_fret >= 1 and (TUNING[6] + barre_fret) % 12 == root_semi)
+    if is_e_shape:
+        target_fret = barre_fret + 2
+        if quality in ['', 'maj', 'major']:
+            fingering_dict["dots"] = [
+                {"string": 5, "fret": target_fret, "finger": 3},
+                {"string": 4, "fret": target_fret, "finger": 4},
+                {"string": 3, "fret": barre_fret + 1, "finger": 2},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 6,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~6번줄) 전체 바레, 약지(3번)·새끼(4번)로 {target_fret}프렛(5, 4번줄), "
+                f"중지(2번)로 {barre_fret + 1}프렛(3번줄)을 누르는 E형 바레 {clean_name} 코드 폼입니다."
+            )
+            return fingering_dict
+        elif quality in ['m', 'min', 'minor', '-']:
+            fingering_dict["dots"] = [
+                {"string": 5, "fret": target_fret, "finger": 3},
+                {"string": 4, "fret": target_fret, "finger": 4},
+            ]
+            fingering_dict["barre"] = {
+                "fret": barre_fret,
+                "start_string": 1,
+                "end_string": 6,
+                "finger": 1
+            }
+            fingering_dict["fingering_summary"] = (
+                f"검지(1번)로 {barre_fret}프렛 (1~6번줄) 전체 바레, 약지(3번)·새끼(4번)로 {target_fret}프렛(5, 4번줄)을 "
+                f"누르는 E형 마이너 바레 {clean_name} 코드 폼입니다."
+            )
+            return fingering_dict
+
+    # 7. 분수코드 (Slash Chord / Inversion) 자동 검출
+    lowest_s, lowest_f, lowest_pitch = detect_lowest_sounding_string(
+        fingering_dict.get("dots") or [],
+        fingering_dict.get("barre"),
+        fingering_dict.get("markers") or {}
+    )
+    if lowest_pitch is not None and lowest_pitch != root_semi:
+        bass_note = SEMITONE_TO_NOTE[lowest_pitch]
+        if slash_bass is None:
+            synth_chord = f"{main_chord}/{bass_note}"
+            fingering_dict["chord"] = synth_chord
+            fingering_dict["fingering_summary"] = (
+                f"{lowest_s}번 줄 {lowest_f}프렛({bass_note} 베이스 음)을 최저음으로 연주하는 "
+                f"전위화음(분수코드) [{synth_chord}] 폼입니다."
+            )
+
+    # 8. 루트 음(Root Note) 최종 정합성 검증 Fallback
     dots = fingering_dict.get("dots") or []
     barre = fingering_dict.get("barre")
     if dots or barre:
-        tuning = {6: 4, 5: 9, 4: 2, 3: 7, 2: 11, 1: 4}
-        root_semi = NOTE_TO_SEMITONE.get(root_str, -1)
-        if root_semi >= 0:
-            chord_notes = set()
-            if isinstance(barre, dict) and _safe_int(barre.get("fret"), 0) > 0:
-                bfret = _safe_int(barre["fret"])
-                b_start = _safe_int(barre.get("start_string"), 1)
-                b_end = _safe_int(barre.get("end_string"), 6)
-                for s in range(min(b_start, b_end), max(b_start, b_end) + 1):
-                    chord_notes.add((tuning[s] + bfret) % 12)
-            for d in dots:
-                if isinstance(d, dict) and _safe_int(d.get("string")) in tuning:
-                    chord_notes.add((tuning[d["string"]] + _safe_int(d.get("fret"))) % 12)
+        chord_notes = set()
+        if isinstance(barre, dict) and _safe_int(barre.get("fret"), 0) > 0:
+            bfret = _safe_int(barre["fret"])
+            b_start = min(_safe_int(barre.get("start_string"), 1), _safe_int(barre.get("end_string"), 6))
+            b_end = max(_safe_int(barre.get("start_string"), 1), _safe_int(barre.get("end_string"), 6))
+            for s in range(b_start, b_end + 1):
+                chord_notes.add((TUNING[s] + bfret) % 12)
+        for d in dots:
+            if isinstance(d, dict) and _safe_int(d.get("string")) in TUNING:
+                chord_notes.add((TUNING[d["string"]] + _safe_int(d.get("fret"))) % 12)
 
-            markers = fingering_dict.get("markers") or {}
-            for s, m in markers.items():
-                if str(m).lower() in ["o", "0", "open"] and int(s) in tuning:
-                    chord_notes.add(tuning[int(s)] % 12)
+        markers = fingering_dict.get("markers") or {}
+        for s, m in markers.items():
+            if str(m).lower() in ["o", "0", "open"] and _safe_int(s) in TUNING:
+                chord_notes.add(TUNING[_safe_int(s)] % 12)
 
-            if root_semi not in chord_notes:
-                # 근음조차 없는 환각 운지이므로 정규 표준 코드 보이싱으로 대체
-                sanitized = resolve_chord_data(clean_name, prefer_fret=prefer_fret or _safe_int(fingering_dict.get("base_fret"), 1))
-                barre_info = sanitized.get("barre")
-                dots_info = sanitized.get("dots") or []
-                desc_parts = []
-                if barre_info:
-                    desc_parts.append(f"검지가 {barre_info.get('fret', 1)}프렛 바레")
-                dot_strs = [f"{d.get('string')}번줄 {d.get('fret')}프렛" for d in dots_info if isinstance(d, dict)]
-                if dot_strs:
-                    desc_parts.append(f"{', '.join(dot_strs)} 운지")
-                sanitized["fingering_summary"] = f"카포 1프렛 기준 {clean_name} 표준 폼 연주 ({', '.join(desc_parts)})"
-                return sanitized
+        if root_semi not in chord_notes and (slash_bass is None or NOTE_TO_SEMITONE.get(slash_bass) not in chord_notes):
+            sanitized = resolve_chord_data(clean_name, prefer_fret=prefer_fret or _safe_int(fingering_dict.get("base_fret"), 1))
+            barre_info = sanitized.get("barre")
+            dots_info = sanitized.get("dots") or []
+            desc_parts = []
+            if barre_info:
+                desc_parts.append(f"검지가 {barre_info.get('fret', 1)}프렛 바레")
+            dot_strs = [f"{d.get('string')}번줄 {d.get('fret')}프렛" for d in dots_info if isinstance(d, dict)]
+            if dot_strs:
+                desc_parts.append(f"{', '.join(dot_strs)} 운지")
+            sanitized["fingering_summary"] = f"{clean_name} 표준 폼 연주 ({', '.join(desc_parts)})"
+            return sanitized
 
     return fingering_dict
 
 
-def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None):
+def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None, dsp_info=None):
     """
     참고 이미지 스타일의 지판 다이어그램 SVG 생성
     """
     valid_custom = False
     if fingering_dict and isinstance(fingering_dict, dict):
-        fingering_dict = sanitize_fingering_with_theory(chord_name, fingering_dict, prefer_fret=prefer_fret)
+        fingering_dict = sanitize_fingering_with_theory(chord_name, fingering_dict, prefer_fret=prefer_fret, dsp_info=dsp_info)
         dots = fingering_dict.get('dots')
         barre = fingering_dict.get('barre')
         if (isinstance(dots, list) and len(dots) > 0) or (isinstance(barre, dict) and barre.get('fret')):
@@ -653,8 +853,9 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None):
         f'box-shadow: 0 4px 12px rgba(0,0,0,0.12); border: 1.5px solid #CBD5E1;">'
     ]
 
+    display_title = str(data.get('chord') or chord_name)
     svg.append(
-        f'<text x="{start_x}" y="24" font-size="17" font-weight="800" fill="#0F1720">{chord_name}</text>'
+        f'<text x="{start_x}" y="24" font-size="17" font-weight="800" fill="#0F1720">{display_title}</text>'
     )
 
     svg.append(
@@ -749,7 +950,7 @@ def generate_chord_svg(chord_name, fingering_dict=None, prefer_fret=None):
     return "".join(svg)
 
 
-def parse_ai_response(text: str):
+def parse_ai_response(text: str, prefer_fret: int = None, dsp_info: dict = None):
     """
     Vision-First JSON 응답 또는 마크다운+JSON 응답에서:
     1) 화면에 표시할 2줄 마크다운 리포트 (1. 정확한 코드명, 2. 지판 위치 및 운지 요약)
@@ -759,7 +960,6 @@ def parse_ai_response(text: str):
     를 반환합니다.
     """
     fingering_dict = None
-    prefer_fret = None
 
     # 1. 전체가 JSON이거나 코드 블록 안에 JSON이 있는 경우 파싱
     cleaned_raw = text.strip()
@@ -783,10 +983,11 @@ def parse_ai_response(text: str):
 
     if fingering_dict and isinstance(fingering_dict, dict):
         detected_chord = str(fingering_dict.get("chord") or "C").strip()
-        fingering_dict = sanitize_fingering_with_theory(detected_chord, fingering_dict)
+        fingering_dict = sanitize_fingering_with_theory(detected_chord, fingering_dict, prefer_fret=prefer_fret, dsp_info=dsp_info)
+        detected_chord = str(fingering_dict.get("chord") or detected_chord).strip()
         summary = str(fingering_dict.get("fingering_summary") or "").strip()
         visual_obs = str(fingering_dict.get("finger_observations") or "").strip()
-        prefer_fret = _safe_int(fingering_dict.get("base_fret"), None)
+        prefer_fret = _safe_int(fingering_dict.get("base_fret"), prefer_fret)
 
         if not summary and visual_obs:
             summary = visual_obs

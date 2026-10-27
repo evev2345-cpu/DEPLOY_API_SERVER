@@ -351,7 +351,10 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
         prompt,
     )
 
-    clean_md, detected_chord, fingering_dict, prefer_fret = chord_visualizer.parse_ai_response(raw_response)
+    clean_md, detected_chord, fingering_dict, prefer_fret = chord_visualizer.parse_ai_response(
+        raw_response,
+        dsp_info=dsp_info,
+    )
 
     # 사운드 분석 근거 명시 보강 (판별된 코드에 상응하는 실음 화성 동적 매칭)
     if dsp_info.get("active_notes"):
@@ -389,6 +392,7 @@ def run_core_analysis(full_frame: Image.Image, wav_bytes: bytes, mode: str):
         detected_chord,
         fingering_dict=fingering_dict,
         prefer_fret=prefer_fret,
+        dsp_info=dsp_info,
     )
 
     return {
