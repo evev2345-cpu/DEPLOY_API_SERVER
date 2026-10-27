@@ -500,13 +500,14 @@ def sanitize_fingering_with_theory(chord_name: str, fingering_dict: dict, prefer
 
     # 0.5. 엄지 썸오버 6번줄 2프렛 파지 시 Bm7 오판정 자동 교정:
     # 6번줄 2프렛에 엄지(T)가 위치하는 경우 이는 물리적으로 F# 계열(F#7/F#m7) 운지입니다.
+    # 단, B 메이저(A형 바레 코드: 검지 2프렛, 약지 4프렛)와 혼동되지 않도록 엄지(T)가 명시되고 B 마이너 계열일 때만 적용합니다.
     dots = fingering_dict.get("dots") or []
     has_thumb_fsharp = any(
-        (str(d.get("finger")).upper() == "T" or d.get("finger") == 1) and
+        str(d.get("finger")).upper() in ["T", "THUMB"] and
         _safe_int(d.get("string")) == 6 and _safe_int(d.get("fret")) == 2
         for d in dots if isinstance(d, dict)
     )
-    if has_thumb_fsharp and root_str == "B":
+    if has_thumb_fsharp and clean_name in ["Bm", "Bm7", "Bmin", "Bmin7"]:
         clean_name = "F#7"
         fingering_dict["chord"] = "F#7"
         root_str = "F#"
